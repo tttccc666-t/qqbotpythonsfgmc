@@ -55,10 +55,9 @@ ACCESS_TOKEN = "TOKEN"  # 访问令牌
 
 # 群组配置
 
-ADMIN_GROUP_ID = 923820685  # 管理群组ID
+ADMIN_GROUP_ID = 123456789  # 管理群组ID
 
 ENABLED_GROUPS = {  # 启用机器人的群组列表
-   923820685,
    123456789,
    987654321
 }
