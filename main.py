@@ -21,13 +21,12 @@ logger = logging.getLogger(__name__)
 # 配置部分
 WS_URL = "ws://154.64.254.98:9181"
 ACCESS_TOKEN = "196183"
-ADMIN_GROUP_ID = 923820685
+ADMIN_GROUP_ID = 123456789
 SLEEP_TARGET_ID = 1724270068  # 战云用户ID
 
 # 启用的群组列表（只有在这些群中才会启用bot）
 ENABLED_GROUPS = {
-    923820685,  # 管理群
-    123456789,  # 示例群组1
+    123456789,  # 示例管理群组
     987654321   # 示例群组2
 }
 
