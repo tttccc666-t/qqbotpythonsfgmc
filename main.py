@@ -21,12 +21,17 @@ logger = logging.getLogger(__name__)
 # 配置部分
 WS_URL = "ws://154.64.254.98:9181"
 ACCESS_TOKEN = "196183"
-ADMIN_GROUP_ID = 123456789
+ADMIN_GROUP_ID = 923820685
 SLEEP_TARGET_ID = 1724270068  # 战云用户ID
+
+# 点赞相关配置
+LIKE_COOLDOWN_HOURS = 24  # 冷却时间（小时）
+LIKE_COUNT = 10  # 每次点赞数量
 
 # 启用的群组列表（只有在这些群中才会启用bot）
 ENABLED_GROUPS = {
-    123456789,  # 示例管理群组
+    923820685,  # 管理群
+    123456789,  # 示例群组1
     987654321   # 示例群组2
 }
 
@@ -73,6 +78,8 @@ class GroupRuleEnforcer:
             "!ban": self.admin_ban,
             "!unban": self.admin_unban
         }
+        # 新增：点赞冷却时间存储（用户ID: 上次点赞时间）
+        self.like_cooldowns: Dict[int, datetime] = {}
 
     async def connect(self):
         """连接到WebSocket服务器"""
@@ -114,6 +121,11 @@ class GroupRuleEnforcer:
             raw_message = event.get("raw_message", "").strip()
             message_id = event.get("message_id")
 
+            # 新增：处理点赞请求（放在其他命令处理前面）
+            if raw_message == "赞我":
+                await self.handle_like_request(group_id, user_id)
+                return
+                
             # 检查睡觉模式命令
             if raw_message == "启动战云睡觉模式":
                 await self.handle_sleep_mode(group_id, user_id, message_id)
@@ -159,6 +171,56 @@ class GroupRuleEnforcer:
         cleaned = CQ_PATTERN.sub('', message)
         # 移除多余空白
         return re.sub(r'\s+', ' ', cleaned).strip()
+
+    # 新增：处理点赞请求
+    async def handle_like_request(self, group_id: int, user_id: int):
+        """处理用户的点赞请求"""
+        try:
+            # 检查是否在冷却期内
+            now = datetime.now()
+            last_liked = self.like_cooldowns.get(user_id)
+            
+            if last_liked and (now - last_liked).total_seconds() < LIKE_COOLDOWN_HOURS * 3600:
+                remaining_hours = (LIKE_COOLDOWN_HOURS * 3600 - (now - last_liked).total_seconds()) / 3600
+                await self.send_notice(group_id, f"⏳ 点赞功能冷却中，请{int(remaining_hours)}小时后再试")
+                return
+            
+            # 执行点赞操作
+            success = await self.send_likes(user_id, LIKE_COUNT)
+            
+            if success:
+                # 更新冷却时间
+                self.like_cooldowns[user_id] = now
+                await self.send_notice(group_id, f"👍 已为用户{user_id}送上{LIKE_COUNT}个赞！")
+                logger.info(f"已为用户{user_id}点赞{LIKE_COUNT}次")
+            else:
+                await self.send_notice(group_id, "❌ 点赞失败，请稍后再试")
+                
+        except Exception as e:
+            logger.error(f"处理点赞请求失败: {str(e)}")
+            await self.send_notice(group_id, "❌ 点赞过程中出现错误")
+
+    # 新增：发送点赞
+    @websocket_lock
+    async def send_likes(self, user_id: int, count: int) -> bool:
+        """通过WebSocket发送点赞"""
+        try:
+            # 发送点赞的API请求
+            payload = {
+                "action": "send_like",
+                "params": {
+                    "user_id": user_id,
+                    "count": count
+                }
+            }
+            
+            response = await self._send_ws(payload)
+            # 根据接口返回判断是否成功
+            return response.get("status") == "ok" or response.get("retcode") == 0
+            
+        except Exception as e:
+            logger.error(f"发送点赞失败: {str(e)}")
+            return False
 
     async def handle_sleep_mode(self, group_id: int, user_id: int, message_id: int):
         """处理战云睡觉模式命令"""
@@ -369,7 +431,8 @@ class GroupRuleEnforcer:
 !unmute <用户ID> - 解除禁言
 !ban <用户ID> - 封禁用户
 !unban <用户ID> - 解封用户
-"启动战云睡觉模式" - 禁言目标用户8小时(仅管理)"""
+"启动战云睡觉模式" - 禁言目标用户8小时(仅管理)
+"赞我" - 获取10个赞（每天一次）"""
         await self.send_notice(group_id, help_msg)
 
     async def show_status(self, group_id: int, user_id: int, args: List[str]):
@@ -390,6 +453,17 @@ class GroupRuleEnforcer:
                 status.append(f"🟡 禁言中（剩余{remaining.seconds//60}分钟）")
             else:
                 del self.mute_list[target_id]
+                
+        # 新增：显示点赞冷却状态
+        if target_id in self.like_cooldowns:
+            last_liked = self.like_cooldowns[target_id]
+            if (datetime.now() - last_liked).total_seconds() < LIKE_COOLDOWN_HOURS * 3600:
+                remaining = (LIKE_COOLDOWN_HOURS * 3600 - (datetime.now() - last_liked).total_seconds()) / 3600
+                status.append(f"👍 点赞冷却中（剩余{int(remaining)}小时）")
+            else:
+                status.append("👍 点赞功能可用")
+        else:
+            status.append("👍 点赞功能可用")
                 
         status.append(f"违规次数: {record.get('count', 0)}次")
         status.append(f"最后违规: {record.get('last_time', '无记录')}")
