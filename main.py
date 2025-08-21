@@ -210,7 +210,7 @@ class GroupRuleEnforcer:
                 "action": "send_like",
                 "params": {
                     "user_id": user_id,
-                    "count": count
+                    "times": count
                 }
             }
             
