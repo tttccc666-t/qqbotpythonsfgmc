@@ -6,6 +6,7 @@ from typing import Dict, Set, Optional, List
 import logging
 from datetime import datetime, timedelta
 from functools import wraps
+import aiohttp
 
 # 配置日志
 logging.basicConfig(
@@ -19,8 +20,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 配置部分
-WS_URL = "ws://154.64.254.98:9181"
-ACCESS_TOKEN = "196183"
+WS_URL = "ws://这不能说喵自己改喵:这不能说喵自己改喵"
+ACCESS_TOKEN = "这不能说喵自己改喵"
 ADMIN_GROUP_ID = 923820685
 SLEEP_TARGET_ID = 1724270068  # 战云用户ID
 
@@ -28,11 +29,22 @@ SLEEP_TARGET_ID = 1724270068  # 战云用户ID
 LIKE_COOLDOWN_HOURS = 24  # 冷却时间（小时）
 LIKE_COUNT = 10  # 每次点赞数量
 
+# Minecraft服务器配置
+MC_SERVERS = {
+    "主服": {"host": "mc.tzi998.com", "port": 25565},
+    "模组服": {"host": "mod.tzi998.com", "port": 25565},
+    # 可以添加更多服务器
+}
+
+# 服务器状态监控配置
+SERVER_CHECK_INTERVAL = 300  # 5分钟检查一次
+SERVER_CHECK_RETRY = 3  # 离线检测重试次数
+SERVER_CHECK_TIMEOUT = 15  # 服务器查询超时时间（秒）
+
 # 启用的群组列表（只有在这些群中才会启用bot）
 ENABLED_GROUPS = {
-    923820685,  # 管理群
-    123456789,  # 示例群组1
-    987654321   # 示例群组2
+    923820685,  # 主群
+    1022514126   # 备用群
 }
 
 # 违禁词库（支持正则表达式）
@@ -60,6 +72,80 @@ def websocket_lock(func):
             return await func(self, *args, **kwargs)
     return wrapper
 
+class MinecraftServerStatus:
+    """Minecraft服务器状态查询类 - 简化版本"""
+    
+    @staticmethod
+    async def query_server(host: str, port: int = 25565) -> dict:
+        """查询Minecraft服务器状态 - 使用可靠的API"""
+        try:
+            # 使用可靠的API端点
+            api_urls = [
+                f"https://api.mcsrvstat.us/3/{host}:{port}",
+                f"https://api.mcsrvstat.us/2/{host}:{port}",
+                f"https://api.mcsrvstat.us/simple/{host}:{port}",
+                f"https://api.mcstatus.io/v2/status/java/{host}:{port}",
+            ]
+            
+            async with aiohttp.ClientSession() as session:
+                for api_url in api_urls:
+                    try:
+                        logger.debug(f"尝试API: {api_url}")
+                        async with session.get(api_url, timeout=SERVER_CHECK_TIMEOUT) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                
+                                # 处理不同的API响应格式
+                                if 'mcsrvstat.us' in api_url:
+                                    if data.get("online", False):
+                                        return {
+                                            "online": True,
+                                            "players": {
+                                                "online": data.get("players", {}).get("online", 0),
+                                                "max": data.get("players", {}).get("max", 0)
+                                            },
+                                            "version": data.get("version", "未知"),
+                                            "motd": data.get("motd", {}).get("clean", ["未知"])[0] if isinstance(data.get("motd"), dict) else "未知"
+                                        }
+                                elif 'mcstatus.io' in api_url:
+                                    if data.get("online", False):
+                                        return {
+                                            "online": True,
+                                            "players": {
+                                                "online": data.get("players", {}).get("online", 0),
+                                                "max": data.get("players", {}).get("max", 0)
+                                            },
+                                            "version": data.get("version", {}).get("name_raw", "未知"),
+                                            "motd": data.get("motd", {}).get("raw", "未知")
+                                        }
+                                
+                    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                        logger.debug(f"API {api_url} 查询失败: {str(e)}")
+                        continue
+            
+            # 如果所有API都失败，尝试直接连接端口
+            try:
+                logger.debug(f"尝试直接连接: {host}:{port}")
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=10
+                )
+                writer.close()
+                await writer.wait_closed()
+                return {
+                    "online": True,
+                    "players": {"online": 0, "max": 0},
+                    "version": "未知（端口可连接）",
+                    "motd": "端口可连接但协议查询失败"
+                }
+            except:
+                pass
+                        
+        except Exception as e:
+            logger.debug(f"服务器查询完全失败 {host}:{port}: {str(e)}")
+        
+        return {"online": False, "players": {"online": 0, "max": 0}, "version": "未知"}
+
 class GroupRuleEnforcer:
     def __init__(self):
         self.ban_list: Set[int] = set()
@@ -74,10 +160,16 @@ class GroupRuleEnforcer:
             "!mute": self.admin_mute,
             "!unmute": self.admin_unmute,
             "!ban": self.admin_ban,
-            "!unban": self.admin_unban
+            "!unban": self.admin_unban,
+            "!mcstatus": self.check_mc_status  # 新增：MC服务器状态命令
         }
         # 新增：点赞冷却时间存储（用户ID: 上次点赞时间）
         self.like_cooldowns: Dict[int, datetime] = {}
+        
+        # 新增：服务器状态监控
+        self.server_status: Dict[str, bool] = {}  # 服务器名称: 是否在线
+        self.server_retry_count: Dict[str, int] = {}  # 服务器名称: 重试次数
+        self.monitor_task = None  # 服务器监控任务
 
     async def connect(self):
         """连接到WebSocket服务器"""
@@ -101,6 +193,10 @@ class GroupRuleEnforcer:
                     "request": True
                 }
             })
+            
+            # 启动服务器状态监控
+            self.monitor_task = asyncio.create_task(self.monitor_servers())
+            
             return True
         except Exception as e:
             logger.error(f"❌ 连接失败: {str(e)}")
@@ -278,6 +374,145 @@ class GroupRuleEnforcer:
         except Exception as e:
             logger.error(f"处理命令时出错: {str(e)}")
 
+    # 新增：处理MC服务器状态查询
+    async def check_mc_status(self, group_id: int, user_id: int, args: List[str]):
+        """查询Minecraft服务器状态"""
+        try:
+            if not args:
+                # 如果没有指定服务器，显示所有服务器状态
+                status_messages = []
+                for server_name, server_config in MC_SERVERS.items():
+                    # 使用更可靠的查询方法
+                    status_data = await self._reliable_server_query(server_config["host"], server_config["port"])
+                    status_emoji = "🟢" if status_data["online"] else "🔴"
+                    status_text = f"{status_emoji} {server_name}: {server_config['host']}"
+                    if status_data["online"]:
+                        status_text += f"\n  玩家: {status_data['players']['online']}/{status_data['players']['max']} | 版本: {status_data['version']}"
+                    else:
+                        status_text += " | 离线"
+                    status_messages.append(status_text)
+                
+                await self.send_notice(group_id, "🎮 Minecraft服务器状态:\n" + "\n".join(status_messages))
+                return
+                
+            # 查询指定服务器
+            server_name = args[0]
+            if server_name not in MC_SERVERS:
+                await self.send_notice(group_id, f"❌ 未知服务器: {server_name}\n可用服务器: {', '.join(MC_SERVERS.keys())}")
+                return
+                
+            server_config = MC_SERVERS[server_name]
+            # 使用更可靠的查询方法
+            status_data = await self._reliable_server_query(server_config["host"], server_config["port"])
+            
+            if status_data["online"]:
+                status_msg = (f"🟢 {server_name} 服务器在线\n"
+                             f"• 地址: {server_config['host']}:{server_config['port']}\n"
+                             f"• 玩家: {status_data['players']['online']}/{status_data['players']['max']}\n"
+                             f"• 版本: {status_data['version']}")
+                if status_data.get('motd'):
+                    status_msg += f"\n• MOTD: {status_data['motd']}"
+            else:
+                status_msg = (f"🔴 {server_name} 服务器离线\n"
+                             f"• 地址: {server_config['host']}:{server_config['port']}\n"
+                             f"• 状态: 无法连接")
+                
+            await self.send_notice(group_id, status_msg)
+            
+        except Exception as e:
+            logger.error(f"查询MC服务器状态失败: {str(e)}")
+            await self.send_notice(group_id, "❌ 查询服务器状态时出错")
+
+    async def _reliable_server_query(self, host: str, port: int) -> dict:
+        """更可靠的服务器查询方法，包含重试机制"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = await MinecraftServerStatus.query_server(host, port)
+                logger.info(f"服务器 {host}:{port} 查询结果: {'在线' if result['online'] else '离线'} (尝试 {attempt + 1})")
+                return result
+            except Exception as e:
+                logger.warning(f"服务器查询尝试 {attempt + 1} 失败: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)  # 等待1秒后重试
+        
+        # 所有尝试都失败，返回离线状态
+        return {"online": False, "players": {"online": 0, "max": 0}, "version": "未知"}
+
+    # 新增：监控服务器状态
+    async def monitor_servers(self):
+        """监控所有Minecraft服务器状态"""
+        # 初始状态设为在线，避免启动时误报
+        for server_name in MC_SERVERS.keys():
+            self.server_status[server_name] = True
+            self.server_retry_count[server_name] = 0
+        
+        logger.info("🔄 开始监控Minecraft服务器状态")
+        
+        while self.running:
+            try:
+                for server_name, server_config in MC_SERVERS.items():
+                    # 使用更可靠的查询方法
+                    status_data = await self._reliable_server_query(server_config["host"], server_config["port"])
+                    is_online = status_data["online"]
+                    previous_status = self.server_status.get(server_name, True)
+                    
+                    logger.info(f"服务器 {server_name} 状态: {'在线' if is_online else '离线'} (之前: {'在线' if previous_status else '离线'})")
+                    
+                    # 如果状态变化
+                    if is_online != previous_status:
+                        if not is_online:
+                            # 服务器离线，增加重试计数
+                            retry_count = self.server_retry_count.get(server_name, 0) + 1
+                            self.server_retry_count[server_name] = retry_count
+                            
+                            logger.info(f"服务器 {server_name} 离线检测 #{retry_count}")
+                            
+                            # 只有多次检测到离线才认为是真的离线
+                            if retry_count >= SERVER_CHECK_RETRY:
+                                self.server_status[server_name] = False
+                                await self.notify_server_status(server_name, False)
+                        else:
+                            # 服务器恢复在线
+                            self.server_status[server_name] = True
+                            self.server_retry_count[server_name] = 0
+                            await self.notify_server_status(server_name, True)
+                    else:
+                        # 状态未变化，重置重试计数
+                        self.server_retry_count[server_name] = 0
+                
+                # 等待下一次检查
+                logger.debug(f"等待 {SERVER_CHECK_INTERVAL} 秒后进行下一次服务器检查")
+                await asyncio.sleep(SERVER_CHECK_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"服务器监控出错: {str(e)}")
+                await asyncio.sleep(SERVER_CHECK_INTERVAL)
+
+    # 新增：通知服务器状态变化
+    async def notify_server_status(self, server_name: str, is_online: bool):
+        """通知服务器状态变化"""
+        try:
+            server_config = MC_SERVERS[server_name]
+            if is_online:
+                # 获取详细的服务器信息
+                status_data = await self._reliable_server_query(server_config["host"], server_config["port"])
+                message = (f"[🟢Online]服务器 {server_name} 已恢复在线\n"
+                          f"• 地址: {server_config['host']}:{server_config['port']}\n"
+                          f"• 玩家: {status_data['players']['online']}/{status_data['players']['max']}")
+            else:
+                message = (f"[🔴Offline]服务器 {server_name} 貌似离线了\n"
+                          f"• 地址: {server_config['host']}:{server_config['port']}\n"
+                          f"• 已尝试检测 {SERVER_CHECK_RETRY} 次确认")
+            
+            # 在所有启用的群组中发送通知
+            for group_id in ENABLED_GROUPS:
+                await self.send_notice(group_id, message)
+                
+            logger.info(f"服务器状态通知: {server_name} {'在线' if is_online else '离线'}")
+        except Exception as e:
+            logger.error(f"发送服务器状态通知失败: {str(e)}")
+
     async def check_violation_words(self, group_id: int, user_id: int, processed_msg: str, raw_msg: str, message_id: int):
         """违禁词检测"""
         if not processed_msg:  # 空消息不检测
@@ -420,6 +655,7 @@ class GroupRuleEnforcer:
                 
         return False
 
+    # 新增：显示帮助信息
     async def show_help(self, group_id: int, user_id: int, args: List[str]):
         """显示帮助信息"""
         help_msg = """🤖 管理命令帮助：
@@ -429,10 +665,12 @@ class GroupRuleEnforcer:
 !unmute <用户ID> - 解除禁言
 !ban <用户ID> - 封禁用户
 !unban <用户ID> - 解封用户
+!mcstatus [服务器名] - 查看MC服务器状态
 "启动战云睡觉模式" - 禁言目标用户8小时(仅管理)
 "赞我" - 获取10个赞（每天一次）"""
         await self.send_notice(group_id, help_msg)
 
+    # 新增：查看用户状态
     async def show_status(self, group_id: int, user_id: int, args: List[str]):
         """查看用户状态"""
         if not args:
@@ -468,6 +706,7 @@ class GroupRuleEnforcer:
         
         await self.send_notice(group_id, f"用户 {target_id} 状态:\n" + "\n".join(status))
 
+    # 新增：管理员禁言
     async def admin_mute(self, group_id: int, user_id: int, args: List[str]):
         """管理员禁言"""
         if len(args) < 2:
@@ -481,6 +720,7 @@ class GroupRuleEnforcer:
         self.mute_list[target_id] = datetime.now() + timedelta(minutes=minutes)
         await self.send_notice(group_id, f"✅ 已禁言用户 {target_id} {minutes}分钟")
 
+    # 新增：管理员解除禁言
     async def admin_unmute(self, group_id: int, user_id: int, args: List[str]):
         """管理员解除禁言"""
         if not args:
@@ -496,6 +736,7 @@ class GroupRuleEnforcer:
         else:
             await self.send_notice(group_id, f"⚠️ 用户 {target_id} 未被禁言")
 
+    # 新增：管理员封禁
     async def admin_ban(self, group_id: int, user_id: int, args: List[str]):
         """管理员封禁"""
         if not args:
@@ -507,6 +748,7 @@ class GroupRuleEnforcer:
         await self.kick_user(group_id, target_id)
         await self.send_notice(group_id, f"✅ 已封禁用户 {target_id}")
 
+    # 新增：管理员解封
     async def admin_unban(self, group_id: int, user_id: int, args: List[str]):
         """管理员解封"""
         if not args:
@@ -632,6 +874,8 @@ class GroupRuleEnforcer:
         self.running = False
         if self.websocket:
             await self.websocket.close()
+        if self.monitor_task:
+            self.monitor_task.cancel()
 
 async def main():
     bot = GroupRuleEnforcer()
